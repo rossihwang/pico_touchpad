@@ -21,23 +21,23 @@ static Gt911Touch touch(i2c_default, 0x14);
 static DmaUart uart(uart0, 115200);
 static bool is_touch_updated = false;
 static int8_t delta_x, delta_y;
+static uint8_t buttons;
 static uint16_t last_x, last_y;
 
 void led_blinking_task(void);
 void hid_task(void);
-void touch_callback(uint gpio, uint32_t events);
+void mouse_task();
 
 int main(void) {
   board_init();
   tusb_init();
-  gpio_set_irq_enabled_with_callback(GT911_INT_PIN, GPIO_IRQ_EDGE_FALL, true,
-                                     touch_callback);
 
   while (1) {
     tud_task();
     led_blinking_task();
 
     hid_task();
+    mouse_task();
   }
 
   return 0;
@@ -80,7 +80,7 @@ static void send_hid_report(uint8_t report_id) {
     case REPORT_ID_KEYBOARD:
       break;
     case REPORT_ID_MOUSE: {
-      tud_hid_mouse_report(REPORT_ID_MOUSE, 0x00, delta_x, delta_y, 0, 0);
+      tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, delta_x, delta_y, 0, 0);
     } break;
     case REPORT_ID_CONSUMER_CONTROL:
       break;
@@ -156,26 +156,137 @@ void led_blinking_task(void) {
   led_state = 1 - led_state;  /// toggle
 }
 
-void touch_callback(uint gpio, uint32_t events) {
+
+void mouse_task() {
+  static uint8_t state;
+  const uint8_t kStInit = 0;
+  const uint8_t kStIdle = 1;
+  const uint8_t kStSingleClick = 2;
+  const uint8_t kStSingleClickRelease = 3;
+  const uint8_t kStDoubleClick = 4;
+  const uint8_t kStRelease = 5;
+  static uint8_t press_counter;
+  static uint8_t release_counter;
+
   std::array<TouchPoint, 5> tps;
   uint8_t status;
-  int tps_amount = touch.read_touch_points(&tps, &status);
-  
-  if (0 < tps_amount) {
-    uart.write("amount: " + std::to_string(tps_amount) + "\r\n");
-    uart.flush();
-    delta_x = tps[0].x - last_x;
-    delta_y = tps[0].y - last_y;
-    last_x = tps[0].x;
-    last_y = tps[0].y;
-  } else {
-    delta_x = 0;
-    delta_y = 0;
-    last_x = 0;
-    last_y = 0;
+
+  const uint32_t interval_ms = 10;
+  static uint32_t start_ms = 0;
+  static uint32_t last_press_stamp;
+
+  if (board_millis() - start_ms < interval_ms) {
+    return;
   }
-  
-  if (last_x != 0 || last_y != 0) {
-    is_touch_updated = true;
+  start_ms += interval_ms;
+  int tps_amount = touch.read_touch_points(&tps, &status);
+
+  last_press_stamp += interval_ms;
+  if (5000 < last_press_stamp) {
+    last_press_stamp = 5000;
+  }
+
+  switch (state) {
+    case kStInit:
+    {
+      state = kStRelease;
+    }
+    break;
+    case kStIdle:
+    {
+      press_counter = 0;
+      release_counter = 0;
+      state = kStRelease;
+    }
+    break;
+    case kStSingleClick:
+    {
+      if (0 == tps_amount) {
+        release_counter++;
+        delta_x = 0;
+        delta_y = 0;
+        if (1 < release_counter) {
+          if (20 < last_press_stamp && last_press_stamp < 200) {
+            buttons |= MOUSE_BUTTON_LEFT;
+            is_touch_updated = true;
+            state = kStSingleClickRelease;
+            uart.write("left single click(" + std::to_string(last_press_stamp) + "\r\n");
+            uart.flush();
+          } else {
+            uart.write("moving release(" + std::to_string(last_press_stamp) + ")\r\n");
+            uart.flush();
+            state = kStIdle;
+          }
+        }
+      } else {
+        release_counter = 0;
+        delta_x = tps[0].x - last_x;
+        delta_y = tps[0].y - last_y;
+        last_x = tps[0].x;
+        last_y = tps[0].y;
+        is_touch_updated = true;
+      }
+    }
+    break;
+    case kStSingleClickRelease:
+    {
+      buttons &= ~MOUSE_BUTTON_LEFT;
+      is_touch_updated = true;
+      state = kStIdle;
+      uart.write("left single click release\r\n");
+      uart.flush();
+    }
+    break;
+    case kStDoubleClick:
+    {
+      if (0 == tps_amount) {
+        release_counter++;
+        if (1 < release_counter) {
+          state = kStIdle;
+          delta_x = 0;  // Avoid sliding after release
+          delta_y = 0;
+          buttons &= ~MOUSE_BUTTON_LEFT;
+          is_touch_updated = true;
+          uart.write("left double click release\r\n");
+          uart.flush();
+        }
+      } else {
+        release_counter = 0;
+        delta_x = tps[0].x - last_x;
+        delta_y = tps[0].y - last_y;
+        last_x = tps[0].x;
+        last_y = tps[0].y;
+        is_touch_updated = true;
+      }
+    }
+    break;
+    case kStRelease:
+    {
+      if (0 < tps_amount) {
+        press_counter++;
+        if (1 < press_counter) {
+          if (100 < last_press_stamp && last_press_stamp < 500) {
+            buttons |= MOUSE_BUTTON_LEFT;
+            is_touch_updated = true;
+            uart.write("left double click(" + std::to_string(last_press_stamp) + ")\r\n");
+            uart.flush();
+            last_press_stamp = 0;
+            state = kStDoubleClick;
+          } else {
+            last_x = tps[0].x;
+            last_y = tps[0].y;
+            last_press_stamp = 0;
+            state = kStSingleClick;
+            uart.write("moving\r\n");
+            uart.flush();
+          }
+        }
+      } else {
+        press_counter = 0;
+      }
+    }
+    break;
+    default:
+    break;
   }
 }
